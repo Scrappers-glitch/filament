@@ -143,13 +143,11 @@ void FrameGraph::execute(backend::DriverApi& driver) noexcept {
                 }
             }
 
-            // TODO: create declared render targets
-
             // call execute
             FrameGraphResources resources(*this, *node);
             node->execute(resources, driver);
 
-            // TODO: destroy declared render targets
+            // destroy declared render targets
 
             // destroy resourcesList
             for (auto& pResource : resourcesList) {

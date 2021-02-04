@@ -17,10 +17,14 @@
 #include "fg2/FrameGraph.h"
 #include "fg2/details/PassNode.h"
 #include "fg2/details/ResourceNode.h"
+#include "ResourceAllocator.h"
 
 #include <string>
 
 namespace filament::fg2 {
+
+PassNode::PassNode(FrameGraph& fg) noexcept : DependencyGraph::Node(fg.getGraph()) {
+}
 
 PassNode::PassNode(PassNode&& rhs) noexcept = default;
 PassNode::~PassNode() noexcept = default;
@@ -32,7 +36,7 @@ utils::CString PassNode::graphvizifyEdgeColor() const noexcept {
 // ------------------------------------------------------------------------------------------------
 
 RenderPassNode::RenderPassNode(FrameGraph& fg, const char* name, PassExecutor* base) noexcept
-        : PassNode(fg.getGraph()), name(name), base(base, fg.getArena()) {
+        : PassNode(fg), mFrameGraph(fg), mName(name), mPassExecutor(base, fg.getArena()) {
 }
 RenderPassNode::RenderPassNode(RenderPassNode&& rhs) noexcept = default;
 RenderPassNode::~RenderPassNode() noexcept = default;
@@ -40,9 +44,41 @@ RenderPassNode::~RenderPassNode() noexcept = default;
 void RenderPassNode::onCulled(DependencyGraph* graph) noexcept {
 }
 
-void RenderPassNode::execute(
-        FrameGraphResources const& resources, backend::DriverApi& driver) noexcept {
-    base->execute(resources, driver);
+void RenderPassNode::execute(FrameGraphResources const& resources,
+        backend::DriverApi& driver) noexcept {
+
+    ResourceAllocatorInterface& resourceAllocator = mFrameGraph.getResourceAllocator();
+
+    // create the render targets
+    for (auto& rt : mRenderTargetData) {
+        assert(any(rt.targetBufferFlags));
+
+        backend::TargetBufferInfo info[6] = {};
+        for (size_t i = 0; i < 6; i++) {
+            if (rt.attachmentInfo[i].isValid()) {
+                info[i].handle = resources.get(rt.attachmentInfo[i]).texture;
+                // TODO: we need to get the sub-resource part of this
+            }
+        }
+
+        // TODO: handle special case for imported render target
+
+        // TODO: we need a name
+        rt.backend.target = resourceAllocator.createRenderTarget(
+                "name", rt.targetBufferFlags,
+                rt.backend.params.viewport.width,
+                rt.backend.params.viewport.height,
+                rt.descriptor.samples,
+                { info[0], info[1], info[2], info[3] },
+                info[4], info[5]);
+    }
+
+    mPassExecutor->execute(resources, driver);
+
+    // destroy the render targets
+    for (auto& rt : mRenderTargetData) {
+        resourceAllocator.destroyRenderTarget(rt.backend.target);
+    }
 }
 
 RenderTarget RenderPassNode::declareRenderTarget(FrameGraph& fg, FrameGraph::Builder& builder,
@@ -60,6 +96,7 @@ RenderTarget RenderPassNode::declareRenderTarget(FrameGraph& fg, FrameGraph::Bui
             attachments.color[i] = builder.write(attachments.color[i],
                     Texture::Usage::COLOR_ATTACHMENT);
             data.outgoing[i] = fg.getResourceNode(attachments.color[i]);
+            data.attachmentInfo[i] = attachments.color[i];
         }
     }
     if (descriptor.attachments.depth.isValid()) {
@@ -67,12 +104,14 @@ RenderTarget RenderPassNode::declareRenderTarget(FrameGraph& fg, FrameGraph::Bui
         attachments.depth = builder.write(attachments.depth,
                 Texture::Usage::DEPTH_ATTACHMENT);
         data.outgoing[4] = fg.getResourceNode(attachments.depth);
+        data.attachmentInfo[4] = attachments.depth;
     }
     if (descriptor.attachments.stencil.isValid()) {
         data.incoming[5] = fg.getResourceNode(attachments.stencil);
         attachments.stencil = builder.write(attachments.stencil,
                 Texture::Usage::STENCIL_ATTACHMENT);
         data.outgoing[5] = fg.getResourceNode(attachments.stencil);
+        data.attachmentInfo[5] = attachments.stencil;
     }
 
     for (size_t i = 0; i < 6; i++) {
@@ -89,8 +128,6 @@ RenderTarget RenderPassNode::declareRenderTarget(FrameGraph& fg, FrameGraph::Bui
 }
 
 void RenderPassNode::resolve() noexcept {
-    // calculate usage bits for our render targets
-
     using namespace backend;
 
     const backend::TargetBufferFlags flags[6] = {
@@ -103,23 +140,39 @@ void RenderPassNode::resolve() noexcept {
     };
 
     for (auto& rt : mRenderTargetData) {
+        /*
+         * Compute discard flags
+         */
         for (size_t i = 0; i < 6; i++) {
             // we use 'outgoing' has a proxy for 'do we have an attachment here?'
             if (rt.outgoing[i]) {
+                rt.targetBufferFlags |= flags[i];
+
                 // start by discarding all the attachments we have
                 // (we could set to ALL, but this is cleaner)
-                rt.params.flags.discardStart |= flags[i];
-                rt.params.flags.discardEnd   |= flags[i];
+                rt.backend.params.flags.discardStart |= flags[i];
+                rt.backend.params.flags.discardEnd   |= flags[i];
                 if (rt.outgoing[i]->hasActiveReaders()) {
-                    rt.params.flags.discardEnd &= ~flags[i];
+                    rt.backend.params.flags.discardEnd &= ~flags[i];
                 }
                 if (rt.incoming[i] && rt.incoming[i]->hasWriter()) {
-                    rt.params.flags.discardStart &= ~flags[i];
+                    rt.backend.params.flags.discardStart &= ~flags[i];
                 }
             }
             // additionally, clear implies discardStart
-            rt.params.flags.discardStart |= rt.params.flags.clear;
+            rt.backend.params.flags.discardStart |= (rt.descriptor.clearFlags & rt.targetBufferFlags);
         }
+
+        /*
+         * Compute other parameters, such as viewport
+         */
+        // TODO: compute viewport
+        // TODO: compute samples
+
+        rt.backend.params.clearColor = rt.descriptor.clearColor;
+        rt.backend.params.flags.clear = (rt.descriptor.clearFlags & rt.targetBufferFlags);
+        rt.backend.params.viewport = rt.descriptor.viewport;
+        rt.descriptor.samples = rt.descriptor.samples;
     }
 }
 
@@ -145,9 +198,9 @@ utils::CString RenderPassNode::graphvizify() const noexcept {
 
     for (auto const& rt :mRenderTargetData) {
         s.append("\\nS:");
-        s.append(utils::to_string(rt.params.flags.discardStart).c_str());
+        s.append(utils::to_string(rt.backend.params.flags.discardStart).c_str());
         s.append(", E:");
-        s.append(utils::to_string(rt.params.flags.discardEnd).c_str());
+        s.append(utils::to_string(rt.backend.params.flags.discardEnd).c_str());
     }
 
     s.append("\", ");
@@ -162,7 +215,7 @@ utils::CString RenderPassNode::graphvizify() const noexcept {
 // ------------------------------------------------------------------------------------------------
 
 PresentPassNode::PresentPassNode(FrameGraph& fg) noexcept
-        : PassNode(fg.getGraph()) {
+        : PassNode(fg) {
 }
 PresentPassNode::PresentPassNode(PresentPassNode&& rhs) noexcept = default;
 PresentPassNode::~PresentPassNode() noexcept = default;

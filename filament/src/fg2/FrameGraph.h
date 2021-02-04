@@ -281,20 +281,20 @@ public:
     FrameGraphId<Texture> import(const char* name, const Texture::Descriptor& desc,
             backend::Handle<backend::HwRenderTarget> target);
 
-    // no user serviceable parts below
-    LinearAllocatorArena& getArena() noexcept { return mArena; }
-    DependencyGraph& getGraph() noexcept { return mGraph; }
-
 private:
     friend class FrameGraphResources;
+    friend class PassNode;
     friend class ResourceNode;
     friend class RenderPassNode;
+
+    LinearAllocatorArena& getArena() noexcept { return mArena; }
+    DependencyGraph& getGraph() noexcept { return mGraph; }
+    ResourceAllocatorInterface& getResourceAllocator() noexcept { return mResourceAllocator; }
 
     struct ResourceSlot {
         int16_t rid;    // VirtualResource* index
         int16_t nid;    // ResourceNode* index
     };
-
     void reset() noexcept;
     void addPresentPass(std::function<void(Builder&)> setup) noexcept;
     Builder addPassInternal(const char* name, PassExecutor* base) noexcept;
